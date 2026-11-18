@@ -1,4 +1,7 @@
 using Microsoft.Maui.Hosting;
+#if MAUI_DEVFLOW
+using Microsoft.Maui.DevFlow.Agent;
+#endif
 
 namespace PortableMap;
 
@@ -9,6 +12,10 @@ public static class MauiProgram
         var builder = MauiApp.CreateBuilder();
         builder
             .UseMauiApp<App>();
+
+#if MAUI_DEVFLOW
+        builder.AddMauiDevFlowAgent();
+#endif
 
         return builder.Build();
     }

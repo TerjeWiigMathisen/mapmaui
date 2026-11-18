@@ -14,7 +14,7 @@ using GraphicsImage = Microsoft.Maui.Graphics.IImage;
 
 namespace PortableMap;
 
-public sealed class MainPage : ContentPage
+public sealed partial class MainPage : ContentPage
 {
     private static readonly FilePickerFileType KmzFileType = new(
         new Dictionary<DevicePlatform, IEnumerable<string>>
@@ -105,6 +105,9 @@ public sealed class MainPage : ContentPage
         pageLayout.Add(_mapView, 0, 1);
         pageLayout.Add(_status, 0, 2);
         Content = pageLayout;
+#if WINDOWS
+        AttachWindowsMapInput();
+#endif
     }
 
     protected override async void OnAppearing()
@@ -183,7 +186,10 @@ public sealed class MainPage : ContentPage
             var loaded = await ReadWorldFileImageAsync(imageFile, worldFile);
             _map.SetLayer(loaded);
             _mapView.Invalidate();
-            SetStatus($"{loaded.Name}  |  World-file coordinates are assumed to be WGS 84 longitude/latitude.");
+            var coordinateSystem = loaded.Reference.UsesUtm32N
+                ? "EPSG:25832 coordinates"
+                : "WGS 84 longitude/latitude";
+            SetStatus($"{loaded.Name}  |  World-file coordinates: {coordinateSystem}.");
         }
         catch (OperationCanceledException)
         {
@@ -273,6 +279,11 @@ public sealed class MainPage : ContentPage
 
     private void OnPanUpdated(object? sender, PanUpdatedEventArgs e)
     {
+#if WINDOWS
+        if (_windowsPointerPanning)
+            return;
+#endif
+
         switch (e.StatusType)
         {
             case GestureStatus.Started:
@@ -293,7 +304,7 @@ public sealed class MainPage : ContentPage
             _pinchStartZoom = _map.Zoom;
         else if (e.Status == GestureStatus.Running)
         {
-            _map.Zoom = Math.Clamp(_pinchStartZoom * e.Scale, 1, 24);
+            _map.Zoom = Math.Clamp(_pinchStartZoom * e.Scale, MapDrawable.MinimumZoom, MapDrawable.MaximumZoom);
             _mapView.Invalidate();
         }
     }
@@ -510,8 +521,9 @@ internal sealed class GeoReference
     private readonly double _c;
     private readonly double _f;
     private readonly bool _worldFile;
+    private readonly bool _utm32N;
 
-    private GeoReference(double a, double d, double b, double e, double c, double f, bool worldFile)
+    private GeoReference(double a, double d, double b, double e, double c, double f, bool worldFile, bool utm32N)
     {
         _a = a;
         _d = d;
@@ -520,21 +532,28 @@ internal sealed class GeoReference
         _c = c;
         _f = f;
         _worldFile = worldFile;
+        _utm32N = utm32N;
     }
 
+    public bool UsesUtm32N => _utm32N;
+
     public static GeoReference ForBounds(double west, double south, double east, double north) =>
-        new(east - west, 0, 0, south - north, west, north, worldFile: false);
+        new(east - west, 0, 0, south - north, west, north, worldFile: false, utm32N: false);
 
     public static GeoReference ForWorldFile(double a, double d, double b, double e, double c, double f)
     {
         var determinant = a * e - b * d;
         if (!double.IsFinite(determinant) || Math.Abs(determinant) < 1e-20)
             throw new InvalidDataException("The world file has a singular coordinate transform.");
-        return new GeoReference(a, d, b, e, c, f, worldFile: true);
+        var utm32N = Math.Abs(c) > 180 || Math.Abs(f) > 90;
+        return new GeoReference(a, d, b, e, c, f, worldFile: true, utm32N);
     }
 
     public bool TryGetPixel(double longitude, double latitude, float imageWidth, float imageHeight, out PointF point)
     {
+        if (_utm32N)
+            (longitude, latitude) = ToUtm32N(longitude, latitude);
+
         var x = longitude - _c;
         var y = latitude - _f;
         if (_worldFile)
@@ -548,6 +567,42 @@ internal sealed class GeoReference
         var boundsColumn = x / _a * imageWidth;
         var boundsRow = y / _e * imageHeight;
         return SetPointIfInside(boundsColumn, boundsRow, imageWidth, imageHeight, out point);
+    }
+
+    private static (double Easting, double Northing) ToUtm32N(double longitude, double latitude)
+    {
+        const double semiMajorAxis = 6_378_137;
+        const double eccentricitySquared = 0.00669438002290;
+        const double scale = 0.9996;
+        const double centralMeridian = 9 * Math.PI / 180;
+
+        var latitudeRadians = latitude * Math.PI / 180;
+        var longitudeRadians = longitude * Math.PI / 180;
+        var sinLatitude = Math.Sin(latitudeRadians);
+        var cosLatitude = Math.Cos(latitudeRadians);
+        var tanLatitude = Math.Tan(latitudeRadians);
+        var secondEccentricitySquared = eccentricitySquared / (1 - eccentricitySquared);
+        var n = semiMajorAxis / Math.Sqrt(1 - eccentricitySquared * sinLatitude * sinLatitude);
+        var t = tanLatitude * tanLatitude;
+        var c = secondEccentricitySquared * cosLatitude * cosLatitude;
+        var a = cosLatitude * (longitudeRadians - centralMeridian);
+        var e4 = eccentricitySquared * eccentricitySquared;
+        var e6 = e4 * eccentricitySquared;
+        var meridionalArc = semiMajorAxis *
+            ((1 - eccentricitySquared / 4 - 3 * e4 / 64 - 5 * e6 / 256) * latitudeRadians
+             - (3 * eccentricitySquared / 8 + 3 * e4 / 32 + 45 * e6 / 1024) * Math.Sin(2 * latitudeRadians)
+             + (15 * e4 / 256 + 45 * e6 / 1024) * Math.Sin(4 * latitudeRadians)
+             - 35 * e6 / 3072 * Math.Sin(6 * latitudeRadians));
+
+        var easting = 500_000 + scale * n *
+            (a + (1 - t + c) * Math.Pow(a, 3) / 6
+             + (5 - 18 * t + t * t + 72 * c - 58 * secondEccentricitySquared) * Math.Pow(a, 5) / 120);
+        var northing = scale *
+            (meridionalArc + n * tanLatitude *
+                (a * a / 2
+                 + (5 - t + 9 * c + 4 * c * c) * Math.Pow(a, 4) / 24
+                 + (61 - 58 * t + t * t + 600 * c - 330 * secondEccentricitySquared) * Math.Pow(a, 6) / 720));
+        return (easting, northing);
     }
 
     private static bool SetPointIfInside(
@@ -572,8 +627,12 @@ internal sealed class GeoReference
 internal sealed class MapDrawable : IDrawable
 {
     private MapLayer? _layer;
+    private RectF _viewport;
 
-    public Location? Location { get; set; }
+    public const double MinimumZoom = 0.05;
+    public const double MaximumZoom = 100;
+
+    public Location? Location { get; set; } = new(59.904473, 10.668472);
     public double Zoom { get; set; } = 1;
     public double PanX { get; set; }
     public double PanY { get; set; }
@@ -588,8 +647,55 @@ internal sealed class MapDrawable : IDrawable
         PanY = 0;
     }
 
+    public void ZoomAtPoint(double zoom, double x, double y)
+    {
+        var newZoom = Math.Clamp(zoom, MinimumZoom, MaximumZoom);
+        var layer = _layer;
+        if (layer is null || _viewport.Width <= 0 || _viewport.Height <= 0)
+        {
+            Zoom = newZoom;
+            return;
+        }
+
+        var currentBounds = GetImageBounds(layer, _viewport, Zoom, PanX, PanY);
+        var imageX = (x - currentBounds.X) / currentBounds.Width;
+        var imageY = (y - currentBounds.Y) / currentBounds.Height;
+        var fitScale = Math.Min(_viewport.Width / layer.Image.Width, _viewport.Height / layer.Image.Height);
+        var nextScale = (float)(fitScale * newZoom);
+        var nextWidth = layer.Image.Width * nextScale;
+        var nextHeight = layer.Image.Height * nextScale;
+        var centeredLeft = _viewport.X + (_viewport.Width - nextWidth) / 2f;
+        var centeredTop = _viewport.Y + (_viewport.Height - nextHeight) / 2f;
+        PanX = x - imageX * nextWidth - centeredLeft;
+        PanY = y - imageY * nextHeight - centeredTop;
+        Zoom = newZoom;
+    }
+
+    public bool TryMapInputPosition(
+        double x,
+        double y,
+        double inputWidth,
+        double inputHeight,
+        out double viewportX,
+        out double viewportY)
+    {
+        if (inputWidth <= 0 || inputHeight <= 0 ||
+            _viewport.Width <= 0 || _viewport.Height <= 0 ||
+            !double.IsFinite(inputWidth) || !double.IsFinite(inputHeight))
+        {
+            viewportX = 0;
+            viewportY = 0;
+            return false;
+        }
+
+        viewportX = _viewport.X + x * _viewport.Width / inputWidth;
+        viewportY = _viewport.Y + y * _viewport.Height / inputHeight;
+        return true;
+    }
+
     public void Draw(ICanvas canvas, RectF dirtyRect)
     {
+        _viewport = dirtyRect;
         var layer = _layer;
         if (layer is null)
         {
@@ -602,21 +708,17 @@ internal sealed class MapDrawable : IDrawable
             return;
         }
 
-        var fitScale = Math.Min(dirtyRect.Width / layer.Image.Width, dirtyRect.Height / layer.Image.Height);
-        var scale = (float)(fitScale * Zoom);
-        var width = layer.Image.Width * scale;
-        var height = layer.Image.Height * scale;
-        var left = dirtyRect.X + (dirtyRect.Width - width) / 2f + (float)PanX;
-        var top = dirtyRect.Y + (dirtyRect.Height - height) / 2f + (float)PanY;
-        canvas.DrawImage(layer.Image, left, top, width, height);
+        var imageBounds = GetImageBounds(layer, dirtyRect, Zoom, PanX, PanY);
+        var scale = imageBounds.Width / layer.Image.Width;
+        canvas.DrawImage(layer.Image, imageBounds.X, imageBounds.Y, imageBounds.Width, imageBounds.Height);
 
         var location = Location;
         if (location is null ||
             !layer.Reference.TryGetPixel(location.Longitude, location.Latitude, layer.Image.Width, layer.Image.Height, out var pixel))
             return;
 
-        var centerX = left + pixel.X * scale;
-        var centerY = top + pixel.Y * scale;
+        var centerX = imageBounds.X + pixel.X * scale;
+        var centerY = imageBounds.Y + pixel.Y * scale;
         var outerDiameter = MillimetersToDip(2f);
         var strokeWidth = MillimetersToDip(0.4f);
         var inset = strokeWidth / 2f;
@@ -627,6 +729,19 @@ internal sealed class MapDrawable : IDrawable
             centerY - outerDiameter / 2 + inset,
             outerDiameter - strokeWidth,
             outerDiameter - strokeWidth);
+    }
+
+    private static RectF GetImageBounds(MapLayer layer, RectF viewport, double zoom, double panX, double panY)
+    {
+        var fitScale = Math.Min(viewport.Width / layer.Image.Width, viewport.Height / layer.Image.Height);
+        var scale = (float)(fitScale * zoom);
+        var width = layer.Image.Width * scale;
+        var height = layer.Image.Height * scale;
+        return new RectF(
+            viewport.X + (viewport.Width - width) / 2f + (float)panX,
+            viewport.Y + (viewport.Height - height) / 2f + (float)panY,
+            width,
+            height);
     }
 
     private static float MillimetersToDip(float millimeters)
