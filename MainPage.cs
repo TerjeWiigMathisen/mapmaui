@@ -3,7 +3,6 @@ using System.IO.Compression;
 using System.Text;
 using System.Xml;
 using System.Xml.Linq;
-using Microsoft.Maui.ApplicationModel;
 using Microsoft.Maui.Controls;
 using Microsoft.Maui.Devices;
 using Microsoft.Maui.Devices.Sensors;
@@ -40,7 +39,6 @@ public sealed partial class MainPage : ContentPage
     private double _panStartX;
     private double _panStartY;
     private double _pinchStartZoom = 1;
-    private bool _isListening;
 
     public MainPage()
     {
@@ -65,8 +63,6 @@ public sealed partial class MainPage : ContentPage
         openKmz.Clicked += OpenKmzClicked;
         var openImage = new Button { Text = "Open image + world file" };
         openImage.Clicked += OpenImageClicked;
-        var locate = new Button { Text = "Locate" };
-        locate.Clicked += LocateClicked;
 
         _status = new Label
         {
@@ -81,7 +77,7 @@ public sealed partial class MainPage : ContentPage
             Padding = new Thickness(8, 4, 8, 0),
             Spacing = 6,
             HorizontalOptions = LayoutOptions.Fill,
-            Children = { openKmz, locate }
+            Children = { openKmz }
         };
         var controls = new VerticalStackLayout
         {
@@ -89,7 +85,6 @@ public sealed partial class MainPage : ContentPage
             Children = { topControls, openImage }
         };
         openKmz.HorizontalOptions = LayoutOptions.Fill;
-        locate.HorizontalOptions = LayoutOptions.Fill;
         openImage.HorizontalOptions = LayoutOptions.Fill;
 
         var pageLayout = new Grid
@@ -108,23 +103,6 @@ public sealed partial class MainPage : ContentPage
 #if WINDOWS
         AttachWindowsMapInput();
 #endif
-    }
-
-    protected override async void OnAppearing()
-    {
-        base.OnAppearing();
-        await StartLocationTrackingAsync();
-    }
-
-    protected override void OnDisappearing()
-    {
-        base.OnDisappearing();
-        Geolocation.Default.LocationChanged -= OnLocationChanged;
-        if (_isListening)
-        {
-            Geolocation.Default.StopListeningForeground();
-            _isListening = false;
-        }
     }
 
     private async void OpenKmzClicked(object? sender, EventArgs e)
@@ -200,81 +178,6 @@ public sealed partial class MainPage : ContentPage
         {
             SetStatus(exception.Message, isError: true);
         }
-    }
-
-    private async void LocateClicked(object? sender, EventArgs e)
-    {
-        await StartLocationTrackingAsync();
-        try
-        {
-            var location = await Geolocation.Default.GetLocationAsync(
-                new GeolocationRequest(GeolocationAccuracy.Medium, TimeSpan.FromSeconds(10)));
-            if (location is not null)
-                UpdateLocation(location);
-        }
-        catch (FeatureNotSupportedException)
-        {
-            SetStatus("Location is not supported on this device.", isError: true);
-        }
-        catch (FeatureNotEnabledException)
-        {
-            SetStatus("Turn on device location services to show your position.", isError: true);
-        }
-        catch (PermissionException)
-        {
-            SetStatus("Location permission is required to show your position.", isError: true);
-        }
-    }
-
-    private async Task StartLocationTrackingAsync()
-    {
-        if (_isListening)
-            return;
-
-        try
-        {
-            var permission = await Permissions.CheckStatusAsync<Permissions.LocationWhenInUse>();
-            if (permission != PermissionStatus.Granted)
-                permission = await Permissions.RequestAsync<Permissions.LocationWhenInUse>();
-
-            if (permission != PermissionStatus.Granted)
-            {
-                SetStatus("Allow location access to show your position.");
-                return;
-            }
-
-            Geolocation.Default.LocationChanged -= OnLocationChanged;
-            Geolocation.Default.LocationChanged += OnLocationChanged;
-            _isListening = await Geolocation.Default.StartListeningForegroundAsync(
-                new GeolocationListeningRequest(GeolocationAccuracy.Medium, TimeSpan.FromSeconds(1)));
-
-            var location = await Geolocation.Default.GetLastKnownLocationAsync();
-            if (location is not null)
-                UpdateLocation(location);
-            else
-                SetStatus("Waiting for a GPS location...");
-        }
-        catch (FeatureNotSupportedException)
-        {
-            SetStatus("Location is not supported on this device.", isError: true);
-        }
-        catch (FeatureNotEnabledException)
-        {
-            SetStatus("Turn on device location services to show your position.", isError: true);
-        }
-        catch (PermissionException)
-        {
-            SetStatus("Location permission is required to show your position.", isError: true);
-        }
-    }
-
-    private void OnLocationChanged(object? sender, GeolocationLocationChangedEventArgs e) =>
-        MainThread.BeginInvokeOnMainThread(() => UpdateLocation(e.Location));
-
-    private void UpdateLocation(Location location)
-    {
-        _map.Location = location;
-        _mapView.Invalidate();
     }
 
     private void OnPanUpdated(object? sender, PanUpdatedEventArgs e)
@@ -658,38 +561,37 @@ internal sealed class MapDrawable : IDrawable
         }
 
         var currentBounds = GetImageBounds(layer, _viewport, Zoom, PanX, PanY);
-        var imageX = (x - currentBounds.X) / currentBounds.Width;
-        var imageY = (y - currentBounds.Y) / currentBounds.Height;
+        var anchorX = Math.Clamp(x, currentBounds.X, currentBounds.X + currentBounds.Width);
+        var anchorY = Math.Clamp(y, currentBounds.Y, currentBounds.Y + currentBounds.Height);
+        var imageX = (anchorX - currentBounds.X) / currentBounds.Width;
+        var imageY = (anchorY - currentBounds.Y) / currentBounds.Height;
         var fitScale = Math.Min(_viewport.Width / layer.Image.Width, _viewport.Height / layer.Image.Height);
         var nextScale = (float)(fitScale * newZoom);
         var nextWidth = layer.Image.Width * nextScale;
         var nextHeight = layer.Image.Height * nextScale;
         var centeredLeft = _viewport.X + (_viewport.Width - nextWidth) / 2f;
         var centeredTop = _viewport.Y + (_viewport.Height - nextHeight) / 2f;
-        PanX = x - imageX * nextWidth - centeredLeft;
-        PanY = y - imageY * nextHeight - centeredTop;
+        PanX = anchorX - imageX * nextWidth - centeredLeft;
+        PanY = anchorY - imageY * nextHeight - centeredTop;
         Zoom = newZoom;
     }
 
     public bool TryMapInputPosition(
         double x,
         double y,
-        double inputWidth,
-        double inputHeight,
         out double viewportX,
         out double viewportY)
     {
-        if (inputWidth <= 0 || inputHeight <= 0 ||
-            _viewport.Width <= 0 || _viewport.Height <= 0 ||
-            !double.IsFinite(inputWidth) || !double.IsFinite(inputHeight))
+        if (_viewport.Width <= 0 || _viewport.Height <= 0 ||
+            !double.IsFinite(x) || !double.IsFinite(y))
         {
             viewportX = 0;
             viewportY = 0;
             return false;
         }
 
-        viewportX = _viewport.X + x * _viewport.Width / inputWidth;
-        viewportY = _viewport.Y + y * _viewport.Height / inputHeight;
+        viewportX = _viewport.X + x;
+        viewportY = _viewport.Y + y;
         return true;
     }
 
