@@ -35,6 +35,7 @@ public sealed partial class MainPage : ContentPage
 
     private readonly MapDrawable _map = new();
     private readonly GraphicsView _mapView;
+    private readonly Grid _mapSurface;
     private readonly Label _status;
     private readonly Label _locationStatus;
     private double _panStartX;
@@ -54,6 +55,8 @@ public sealed partial class MainPage : ContentPage
             HorizontalOptions = LayoutOptions.Fill,
             VerticalOptions = LayoutOptions.Fill
         };
+        _mapSurface = new Grid();
+        _mapSurface.Children.Add(_mapView);
         var pan = new PanGestureRecognizer();
         pan.PanUpdated += OnPanUpdated;
         var pinch = new PinchGestureRecognizer();
@@ -65,6 +68,23 @@ public sealed partial class MainPage : ContentPage
         openKmz.Clicked += OpenKmzClicked;
         var openImage = new Button { Text = "Open image + world file" };
         openImage.Clicked += OpenImageClicked;
+        var centerOnLocation = new Button
+        {
+            Text = "⊕",
+            FontSize = 22,
+            Padding = new Thickness(0),
+            WidthRequest = 48
+        };
+        SemanticProperties.SetDescription(centerOnLocation, "Center map on current GPS location");
+        centerOnLocation.Clicked += CenterOnLocationClicked;
+        var resetView = new Button
+        {
+            Text = "R",
+            Padding = new Thickness(0),
+            WidthRequest = 48
+        };
+        SemanticProperties.SetDescription(resetView, "Reset map size, position, and orientation");
+        resetView.Clicked += ResetViewClicked;
 
         _status = new Label
         {
@@ -81,19 +101,29 @@ public sealed partial class MainPage : ContentPage
             TextColor = Color.FromArgb("#59636D")
         };
 
-        var topControls = new HorizontalStackLayout
+        var topControls = new Grid
         {
             Padding = new Thickness(8, 4, 8, 0),
-            Spacing = 6,
-            HorizontalOptions = LayoutOptions.Fill,
-            Children = { openKmz }
+            ColumnSpacing = 6,
+            ColumnDefinitions =
+            {
+                new ColumnDefinition(GridLength.Star),
+                new ColumnDefinition(GridLength.Auto),
+                new ColumnDefinition(GridLength.Auto)
+            },
+            RowDefinitions = { new RowDefinition(GridLength.Auto) }
         };
+        topControls.Add(openKmz, 0, 0);
+        topControls.Add(centerOnLocation, 1, 0);
+        topControls.Add(resetView, 2, 0);
         var controls = new VerticalStackLayout
         {
             Spacing = 0,
             Children = { topControls, openImage }
         };
         openKmz.HorizontalOptions = LayoutOptions.Fill;
+        centerOnLocation.HorizontalOptions = LayoutOptions.Center;
+        resetView.HorizontalOptions = LayoutOptions.Center;
         openImage.HorizontalOptions = LayoutOptions.Fill;
 
         var pageLayout = new Grid
@@ -111,9 +141,12 @@ public sealed partial class MainPage : ContentPage
             Children = { _status, _locationStatus }
         };
         pageLayout.Add(controls, 0, 0);
-        pageLayout.Add(_mapView, 0, 1);
+        pageLayout.Add(_mapSurface, 0, 1);
         pageLayout.Add(statusLayout, 0, 2);
         Content = pageLayout;
+#if ANDROID
+        AttachAndroidMapRotation();
+#endif
 #if WINDOWS
         AttachWindowsMapInput();
 #endif
@@ -153,6 +186,9 @@ public sealed partial class MainPage : ContentPage
             var loaded = await ReadKmzAsync(file);
             _map.SetLayer(loaded);
             _mapView.Invalidate();
+#if WINDOWS
+            UpdateWindowsCompass();
+#endif
             SetStatus($"{loaded.Name}  |  KMZ GroundOverlay");
         }
         catch (OperationCanceledException)
@@ -196,6 +232,9 @@ public sealed partial class MainPage : ContentPage
             var loaded = await ReadWorldFileImageAsync(imageFile, worldFile);
             _map.SetLayer(loaded);
             _mapView.Invalidate();
+#if WINDOWS
+            UpdateWindowsCompass();
+#endif
             var coordinateSystem = loaded.Reference.UsesUtm32N
                 ? "EPSG:25832 coordinates"
                 : "WGS 84 longitude/latitude";
@@ -215,7 +254,7 @@ public sealed partial class MainPage : ContentPage
     private void OnPanUpdated(object? sender, PanUpdatedEventArgs e)
     {
 #if WINDOWS
-        if (_windowsPointerPanning)
+        if (_windowsPointerPanning || _windowsCompassDragging)
             return;
 #endif
 
@@ -226,11 +265,32 @@ public sealed partial class MainPage : ContentPage
                 _panStartY = _map.PanY;
                 break;
             case GestureStatus.Running:
-                _map.PanX = _panStartX + e.TotalX;
-                _map.PanY = _panStartY + e.TotalY;
+                var delta = _map.ScreenDeltaToMap(e.TotalX, e.TotalY);
+                _map.PanX = _panStartX + delta.X;
+                _map.PanY = _panStartY + delta.Y;
                 _mapView.Invalidate();
                 break;
         }
+    }
+
+    private void CenterOnLocationClicked(object? sender, EventArgs e)
+    {
+        if (!_map.CenterOnLocation())
+        {
+            SetStatus("Load a map and wait for a GPS fix before centering.", isError: true);
+            return;
+        }
+
+        _mapView.Invalidate();
+    }
+
+    private void ResetViewClicked(object? sender, EventArgs e)
+    {
+        _map.ResetView();
+        _mapView.Invalidate();
+#if WINDOWS
+        UpdateWindowsCompass();
+#endif
     }
 
     private void OnPinchUpdated(object? sender, PinchGestureUpdatedEventArgs e)
@@ -244,6 +304,8 @@ public sealed partial class MainPage : ContentPage
             if (_map.TryMapInputPosition(
                     origin.X * _mapView.Width,
                     origin.Y * _mapView.Height,
+                    _mapView.Width,
+                    _mapView.Height,
                     out var x,
                     out var y))
                 _map.ZoomAtPoint(zoom, x, y);
@@ -280,7 +342,8 @@ public sealed partial class MainPage : ContentPage
                         {
                             _map.Location = location;
                             _mapView.Invalidate();
-                            SetLocationStatus("GPS: Live location active.");
+                            SetLocationStatus(FormattableString.Invariant(
+                                $"GPS: {location.Latitude:F6}, {location.Longitude:F6}"));
                         });
                     }
                 }
@@ -563,12 +626,12 @@ internal sealed class GeoReference
             var determinant = _a * _e - _b * _d;
             var column = (x * _e - _b * y) / determinant + 0.5;
             var row = (_a * y - x * _d) / determinant + 0.5;
-            return SetPointIfInside(column, row, imageWidth, imageHeight, out point);
+            return SetPointIfFinite(column, row, out point);
         }
 
         var boundsColumn = x / _a * imageWidth;
         var boundsRow = y / _e * imageHeight;
-        return SetPointIfInside(boundsColumn, boundsRow, imageWidth, imageHeight, out point);
+        return SetPointIfFinite(boundsColumn, boundsRow, out point);
     }
 
     private static (double Easting, double Northing) ToUtm32N(double longitude, double latitude)
@@ -607,21 +670,21 @@ internal sealed class GeoReference
         return (easting, northing);
     }
 
-    private static bool SetPointIfInside(
+    private static bool SetPointIfFinite(
         double column,
         double row,
-        float imageWidth,
-        float imageHeight,
         out PointF point)
     {
+        var pixelX = (float)column;
+        var pixelY = (float)row;
         if (!double.IsFinite(column) || !double.IsFinite(row) ||
-            column < 0 || column > imageWidth || row < 0 || row > imageHeight)
+            !float.IsFinite(pixelX) || !float.IsFinite(pixelY))
         {
             point = default;
             return false;
         }
 
-        point = new PointF((float)column, (float)row);
+        point = new PointF(pixelX, pixelY);
         return true;
     }
 }
@@ -636,6 +699,7 @@ internal sealed class MapDrawable : IDrawable
 
     public Location? Location { get; set; }
     public double Zoom { get; set; } = 1;
+    public double RotationDegrees { get; private set; }
     public double PanX { get; set; }
     public double PanY { get; set; }
 
@@ -644,9 +708,54 @@ internal sealed class MapDrawable : IDrawable
         if (_layer?.Image is IDisposable disposable)
             disposable.Dispose();
         _layer = layer;
+        ResetView();
+    }
+
+    public void ResetView()
+    {
         Zoom = 1;
         PanX = 0;
         PanY = 0;
+        RotationDegrees = 0;
+    }
+
+    public void RotateBy(double degrees)
+    {
+        if (double.IsFinite(degrees))
+            RotationDegrees = NormalizeDegrees(RotationDegrees + degrees);
+    }
+
+    public PointF ScreenDeltaToMap(double x, double y)
+    {
+        var delta = RotateVector(x, y, -RotationDegrees);
+        return new PointF((float)delta.X, (float)delta.Y);
+    }
+
+    public void PanByScreenDelta(double x, double y)
+    {
+        var delta = ScreenDeltaToMap(x, y);
+        PanX += delta.X;
+        PanY += delta.Y;
+    }
+
+    public bool CenterOnLocation()
+    {
+        var layer = _layer;
+        var location = Location;
+        if (layer is null || location is null || _viewport.Width <= 0 || _viewport.Height <= 0 ||
+            !layer.Reference.TryGetPixel(
+                location.Longitude,
+                location.Latitude,
+                layer.Image.Width,
+                layer.Image.Height,
+                out var pixel))
+            return false;
+
+        var imageBounds = GetImageBounds(layer, _viewport, Zoom, PanX, PanY);
+        var scale = imageBounds.Width / layer.Image.Width;
+        PanX += _viewport.X + _viewport.Width / 2f - (imageBounds.X + pixel.X * scale);
+        PanY += _viewport.Y + _viewport.Height / 2f - (imageBounds.Y + pixel.Y * scale);
+        return true;
     }
 
     public void ZoomAtPoint(double zoom, double x, double y)
@@ -658,6 +767,12 @@ internal sealed class MapDrawable : IDrawable
             Zoom = newZoom;
             return;
         }
+
+        var viewportCenterX = _viewport.X + _viewport.Width / 2f;
+        var viewportCenterY = _viewport.Y + _viewport.Height / 2f;
+        var mapPosition = RotateVector(x - viewportCenterX, y - viewportCenterY, -RotationDegrees);
+        x = viewportCenterX + mapPosition.X;
+        y = viewportCenterY + mapPosition.Y;
 
         var currentBounds = GetImageBounds(layer, _viewport, Zoom, PanX, PanY);
         var anchorX = Math.Clamp(x, currentBounds.X, currentBounds.X + currentBounds.Width);
@@ -678,20 +793,38 @@ internal sealed class MapDrawable : IDrawable
     public bool TryMapInputPosition(
         double x,
         double y,
+        double inputWidth,
+        double inputHeight,
         out double viewportX,
         out double viewportY)
     {
         if (_viewport.Width <= 0 || _viewport.Height <= 0 ||
-            !double.IsFinite(x) || !double.IsFinite(y))
+            inputWidth <= 0 || inputHeight <= 0 ||
+            !double.IsFinite(x) || !double.IsFinite(y) ||
+            !double.IsFinite(inputWidth) || !double.IsFinite(inputHeight))
         {
             viewportX = 0;
             viewportY = 0;
             return false;
         }
 
-        viewportX = _viewport.X + x;
-        viewportY = _viewport.Y + y;
+        viewportX = _viewport.X + x * _viewport.Width / inputWidth;
+        viewportY = _viewport.Y + y * _viewport.Height / inputHeight;
         return true;
+    }
+
+    private static double NormalizeDegrees(double degrees)
+    {
+        var normalized = degrees % 360;
+        return normalized < 0 ? normalized + 360 : normalized;
+    }
+
+    private static (double X, double Y) RotateVector(double x, double y, double degrees)
+    {
+        var radians = degrees * Math.PI / 180;
+        var cosine = Math.Cos(radians);
+        var sine = Math.Sin(radians);
+        return (x * cosine - y * sine, x * sine + y * cosine);
     }
 
     public void Draw(ICanvas canvas, RectF dirtyRect)
@@ -711,17 +844,37 @@ internal sealed class MapDrawable : IDrawable
 
         var imageBounds = GetImageBounds(layer, dirtyRect, Zoom, PanX, PanY);
         var scale = imageBounds.Width / layer.Image.Width;
+        var viewportCenterX = dirtyRect.X + dirtyRect.Width / 2f;
+        var viewportCenterY = dirtyRect.Y + dirtyRect.Height / 2f;
+        canvas.SaveState();
+        canvas.Rotate((float)RotationDegrees, viewportCenterX, viewportCenterY);
         canvas.DrawImage(layer.Image, imageBounds.X, imageBounds.Y, imageBounds.Width, imageBounds.Height);
+        canvas.RestoreState();
 
         var location = Location;
         if (location is null ||
             !layer.Reference.TryGetPixel(location.Longitude, location.Latitude, layer.Image.Width, layer.Image.Height, out var pixel))
             return;
 
-        var centerX = imageBounds.X + pixel.X * scale;
-        var centerY = imageBounds.Y + pixel.Y * scale;
+        var mapPoint = RotateVector(
+            imageBounds.X + pixel.X * scale - viewportCenterX,
+            imageBounds.Y + pixel.Y * scale - viewportCenterY,
+            RotationDegrees);
+        var centerX = viewportCenterX + (float)mapPoint.X;
+        var centerY = viewportCenterY + (float)mapPoint.Y;
         var outerDiameter = MillimetersToDip(2f);
-        var strokeWidth = MillimetersToDip(0.4f);
+        var strokeWidth = MillimetersToDip(0.5f);
+        var radius = outerDiameter / 2f;
+        var minimumX = dirtyRect.X + radius;
+        var maximumX = dirtyRect.X + dirtyRect.Width - radius;
+        var minimumY = dirtyRect.Y + radius;
+        var maximumY = dirtyRect.Y + dirtyRect.Height - radius;
+        centerX = minimumX <= maximumX
+            ? Math.Clamp(centerX, minimumX, maximumX)
+            : dirtyRect.X + dirtyRect.Width / 2f;
+        centerY = minimumY <= maximumY
+            ? Math.Clamp(centerY, minimumY, maximumY)
+            : dirtyRect.Y + dirtyRect.Height / 2f;
         var inset = strokeWidth / 2f;
         canvas.StrokeColor = Color.FromRgba(30, 136, 229, 180);
         canvas.StrokeSize = strokeWidth;
