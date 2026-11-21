@@ -36,9 +36,11 @@ public sealed partial class MainPage : ContentPage
     private readonly MapDrawable _map = new();
     private readonly GraphicsView _mapView;
     private readonly Label _status;
+    private readonly Label _locationStatus;
     private double _panStartX;
     private double _panStartY;
     private double _pinchStartZoom = 1;
+    private CancellationTokenSource? _locationTrackingCancellation;
 
     public MainPage()
     {
@@ -71,6 +73,13 @@ public sealed partial class MainPage : ContentPage
             FontSize = 13,
             TextColor = Color.FromArgb("#303840")
         };
+        _locationStatus = new Label
+        {
+            Text = "GPS: Waiting for location permission.",
+            Padding = new Thickness(12, 0, 12, 6),
+            FontSize = 12,
+            TextColor = Color.FromArgb("#59636D")
+        };
 
         var topControls = new HorizontalStackLayout
         {
@@ -96,13 +105,36 @@ public sealed partial class MainPage : ContentPage
                 new RowDefinition(GridLength.Auto)
             }
         };
+        var statusLayout = new VerticalStackLayout
+        {
+            Spacing = 0,
+            Children = { _status, _locationStatus }
+        };
         pageLayout.Add(controls, 0, 0);
         pageLayout.Add(_mapView, 0, 1);
-        pageLayout.Add(_status, 0, 2);
+        pageLayout.Add(statusLayout, 0, 2);
         Content = pageLayout;
 #if WINDOWS
         AttachWindowsMapInput();
 #endif
+    }
+
+    protected override void OnAppearing()
+    {
+        base.OnAppearing();
+        if (_locationTrackingCancellation is not null)
+            return;
+
+        _locationTrackingCancellation = new CancellationTokenSource();
+        _ = TrackLocationAsync(_locationTrackingCancellation.Token);
+    }
+
+    protected override void OnDisappearing()
+    {
+        _locationTrackingCancellation?.Cancel();
+        _locationTrackingCancellation?.Dispose();
+        _locationTrackingCancellation = null;
+        base.OnDisappearing();
     }
 
     private async void OpenKmzClicked(object? sender, EventArgs e)
@@ -207,9 +239,76 @@ public sealed partial class MainPage : ContentPage
             _pinchStartZoom = _map.Zoom;
         else if (e.Status == GestureStatus.Running)
         {
-            _map.Zoom = Math.Clamp(_pinchStartZoom * e.Scale, MapDrawable.MinimumZoom, MapDrawable.MaximumZoom);
+            var zoom = _pinchStartZoom * e.Scale;
+            var origin = e.ScaleOrigin;
+            if (_map.TryMapInputPosition(
+                    origin.X * _mapView.Width,
+                    origin.Y * _mapView.Height,
+                    out var x,
+                    out var y))
+                _map.ZoomAtPoint(zoom, x, y);
+            else
+                _map.Zoom = Math.Clamp(zoom, MapDrawable.MinimumZoom, MapDrawable.MaximumZoom);
             _mapView.Invalidate();
         }
+    }
+
+    private async Task TrackLocationAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var permission = await Permissions.CheckStatusAsync<Permissions.LocationWhenInUse>();
+            if (permission != PermissionStatus.Granted)
+                permission = await Permissions.RequestAsync<Permissions.LocationWhenInUse>();
+
+            if (permission != PermissionStatus.Granted)
+            {
+                SetLocationStatus("GPS: Location permission was not granted.", isError: true);
+                return;
+            }
+
+            SetLocationStatus("GPS: Waiting for a location fix.");
+            var request = new GeolocationRequest(GeolocationAccuracy.Best, TimeSpan.FromSeconds(10));
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    var location = await Geolocation.Default.GetLocationAsync(request, cancellationToken);
+                    if (location is not null && !cancellationToken.IsCancellationRequested)
+                    {
+                        MainThread.BeginInvokeOnMainThread(() =>
+                        {
+                            _map.Location = location;
+                            _mapView.Invalidate();
+                            SetLocationStatus("GPS: Live location active.");
+                        });
+                    }
+                }
+                catch (TimeoutException)
+                {
+                    SetLocationStatus("GPS: Waiting for a location fix.");
+                }
+
+                await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            System.Diagnostics.Debug.WriteLine($"GPS tracking failed: {exception}");
+            SetLocationStatus($"GPS: {exception.Message}", isError: true);
+        }
+    }
+
+    private void SetLocationStatus(string text, bool isError = false)
+    {
+        MainThread.BeginInvokeOnMainThread(() =>
+        {
+            _locationStatus.Text = text;
+            _locationStatus.TextColor = isError ? Colors.DarkRed : Color.FromArgb("#59636D");
+        });
     }
 
     private void SetStatus(string text, bool isError = false)
@@ -535,7 +634,7 @@ internal sealed class MapDrawable : IDrawable
     public const double MinimumZoom = 0.05;
     public const double MaximumZoom = 100;
 
-    public Location? Location { get; set; } = new(59.904473, 10.668472);
+    public Location? Location { get; set; }
     public double Zoom { get; set; } = 1;
     public double PanX { get; set; }
     public double PanY { get; set; }
